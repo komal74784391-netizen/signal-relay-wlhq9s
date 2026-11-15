@@ -18,6 +18,58 @@ class SamplerState:
             self.samples = []
 
 
+class BackpressureSampler:
+    """Samples permit lag and decides when to throttle a shard.
+
+    Split out of the ingest worker in AR-1391 so that retry accounting and
+    sampler accounting share a single owner.
+    """
+
+    METRIC_NAME = "relay_sampler_lag_ms"
+
+    def __init__(self, window_ms: int = 500, budget_ms: float = 250.0):
+        self.state = SamplerState(window_ms=window_ms)
+        self.budget_ms = budget_ms
+
+    def observe(self, lag_ms: float) -> float:
+        """Record one lag reading and return the median."""
+        self.state.samples.append(float(lag_ms))
+        if len(self.state.samples) > max(8, self.state.window_ms // 50):
+            self.state.samples = self.state.samples[-8:]
+        self.state.last_lag_ms = sample(self.state.samples, self.state.window_ms)
+        return self.state.last_lag_ms
+
+    def throttle_factor(self) -> float:
+        """Admit fraction for the next window."""
+        return throttle_factor(self.state.last_lag_ms, self.budget_ms)
+
+    def metric_line(self) -> str:
+        """Prometheus line for the p95 sampler lag."""
+        p95 = lag_percentile(self.state.samples, 0.95)
+        return export_gauge(self.METRIC_NAME, p95)
+
+    def reset(self) -> None:
+        """Clear samples after a reconnect."""
+        reset_state(self.state)
+
+    def snapshot(self) -> dict:
+        """Snapshot for the exporter."""
+        return {
+            "window_ms": self.state.window_ms,
+            "last_lag_ms": self.state.last_lag_ms,
+            "samples": list(self.state.samples),
+            "budget_ms": self.budget_ms,
+        }
+
+    def resize(self, window_ms: int) -> None:
+        """Resize the sampling window in place."""
+        resize_window(self.state, window_ms)
+
+    def stable(self) -> bool:
+        """Whether the sampler settled at the current window."""
+        return is_stable(self.state)
+
+
 def percentile(values, pct: float) -> float:
     """Small percentile helper that does not depend on numpy."""
     if not values:
@@ -90,3 +142,9 @@ def estimate_permit_lag(queue_depth: int, in_flight: int) -> float:
 def export_gauge(metric_name: str, value: float) -> str:
     """Render one Prometheus-style gauge line."""
     return f"{metric_name} {value:.2f}"
+
+
+def sampler_pressure(sampler: BackpressureSampler, queue_depth: int) -> float:
+    """Combined pressure used by the admission controller."""
+    lag = sampler.observe(estimate_permit_lag(queue_depth, 0))
+    return throttle_factor(lag, sampler.budget_ms)
