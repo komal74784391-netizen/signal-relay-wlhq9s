@@ -5,8 +5,9 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
 
-MAX_ATTEMPTS = 2
+MAX_ATTEMPTS = 6
 BASE_DELAY_SECONDS = 1.5
+MAX_DELAY_SECONDS = 10.0
 
 
 class TransientPoolError(RuntimeError):
@@ -46,7 +47,11 @@ class IngestWorker:
                 return
             except TransientPoolError:
                 job.attempts += 1
-                await asyncio.sleep(BASE_DELAY_SECONDS * job.attempts)
+                delay = min(
+                    BASE_DELAY_SECONDS * (2 ** job.attempts),
+                    MAX_DELAY_SECONDS,
+                )
+                await asyncio.sleep(delay)
         await self.pool.dead_letter(job)
 
     def budget_remaining(self, job: ShardJob) -> int:
@@ -77,10 +82,10 @@ def build_worker(queue, pool, name: Optional[str] = None) -> IngestWorker:
 def attempt_delay(attempt: int) -> float:
     """Delay before the next attempt.
 
-    The 1.4 ladder is deliberately short; AR-1427 widens it on the release
-    branch.
+    The 1.4 ladder is capped so a noisy shard cannot monopolise the worker
+    pool for more than a minute.
     """
-    return BASE_DELAY_SECONDS * max(1, attempt)
+    return min(BASE_DELAY_SECONDS * (2 ** max(1, attempt)), MAX_DELAY_SECONDS)
 
 
 def is_exhausted(job: ShardJob) -> bool:
@@ -112,7 +117,10 @@ def job_summary(jobs) -> dict:
 
 def retry_ladder_description() -> str:
     """Describe the ladder for the operator help page."""
-    return f"at most {MAX_ATTEMPTS} attempts, base delay {BASE_DELAY_SECONDS}s"
+    return (
+        f"at most {MAX_ATTEMPTS} attempts, base delay {BASE_DELAY_SECONDS}s, "
+        f"capped at {MAX_DELAY_SECONDS}s"
+    )
 
 
 def coerce_payload(value) -> bytes:
@@ -134,4 +142,5 @@ def backoff_cap_declaration() -> dict:
     return {
         "max_attempts": MAX_ATTEMPTS,
         "base_delay_seconds": BASE_DELAY_SECONDS,
+        "max_delay_seconds": MAX_DELAY_SECONDS,
     }
