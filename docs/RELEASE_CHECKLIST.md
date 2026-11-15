@@ -13,7 +13,6 @@ Owner: release engineering
 - **src/relay/ingest.py:88** — cap the per-shard retry budget
 - **src/relay/backpressure.py:141** — expose sampler lag as a metric
 - **src/relay/buffer.py:57** — assert the ring buffer never wraps twice per flush
-- **src/relay/compact.py:206** — re-arm the compaction loop after a partial flush
 
 ## Sign-off
 
